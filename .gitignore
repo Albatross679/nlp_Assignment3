@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+output/
+model/
+.claude/
+temp.md
+*.tar.gz
+wandb/
+
+# Large files
+*.zip
+*.db
+
+# Training artifacts
+checkpoints/
+mlruns/
+part1_exp/
+
+# Skill files
+*.skill
+
+# Assignment PDF (large binary)
+CSE_5525__Assignment_3__Spring_2026_.pdf
