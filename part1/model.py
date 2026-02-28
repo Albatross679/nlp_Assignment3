@@ -87,4 +87,4 @@ def load_model_from_checkpoint(checkpoint_dir, finetune=True, model_checkpoint=D
     model = initialize_model(finetune=finetune, model_checkpoint=model_checkpoint,
                              dropout=dropout, device=device)
     model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
-    return model.to(device)
+    return model

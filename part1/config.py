@@ -40,8 +40,6 @@ class T5FineTuneConfig(SLNeuralClsConfig):
     max_new_tokens: int = 256
     num_beams: int = 1
 
-    def __post_init__(self):
-        super().__post_init__()
 
 @dataclass
 class T5FineTuneConfig_freeze_encoder(T5FineTuneConfig):
@@ -49,5 +47,3 @@ class T5FineTuneConfig_freeze_encoder(T5FineTuneConfig):
     freeze_encoder: bool = True
     num_beams: int = 3
     input_prefix: str = ""
-    
-    

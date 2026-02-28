@@ -21,19 +21,19 @@ Usage examples:
 import argparse
 import json
 import os
-import sys
 import sqlite3
+import sys
+from pathlib import Path
 
 import torch
-from transformers import T5TokenizerFast
 
 # Ensure project root is on the path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from part1.model import load_model_from_checkpoint, initialize_model
-from part1.data import T5Dataset, normal_collate_fn, get_dataloader
-from utils import compute_metrics, save_queries_and_records, compute_records
+from part1.model import load_model_from_checkpoint
+from part1.data import get_dataloader, _TOKENIZER
+from utils import compute_metrics, save_queries_and_records
 
 DB_PATH = "data/flight_database.db"
 
@@ -230,7 +230,7 @@ def main():
     print(f"Model loaded: {num_params:,} parameters")
 
     # ── 6. Load tokenizer and dev data ───────────────────────────────────────
-    tokenizer = T5TokenizerFast.from_pretrained(model_checkpoint)
+    tokenizer = _TOKENIZER
 
     input_prefix = cfg.get("input_prefix", "")
     include_schema = cfg.get("include_schema", False)
@@ -338,8 +338,7 @@ def main():
 
     # Cleanup temp files
     for f in [tmp_pred_sql, tmp_pred_pkl]:
-        if os.path.exists(f):
-            os.remove(f)
+        Path(f).unlink(missing_ok=True)
 
     print(f"\nDone.")
 

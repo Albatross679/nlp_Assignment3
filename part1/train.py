@@ -1,28 +1,57 @@
 """Part 1 training: train loop, eval, test inference for T5 fine-tune."""
 
+import argparse
 import gc
 import time
-import argparse
 from pathlib import Path
-from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
-from part1.model import initialize_model, save_model, load_model_from_checkpoint, save_training_state, load_training_state
-from part1.data import load_t5_data
+from part1.data import PAD_IDX, _TOKENIZER, load_t5_data
+from part1.model import (
+    initialize_model,
+    load_model_from_checkpoint,
+    load_training_state,
+    save_model,
+    save_training_state,
+)
 from src.infrastructure import setup_run
+from src.mlflow_utils import (
+    end_mlflow_run,
+    log_epoch_metrics,
+    log_extra_params,
+    log_model_checkpoint,
+    setup_mlflow,
+)
 from src.utils.system_metrics import collect_system_metrics
-
 from t5_utils import initialize_optimizer_and_scheduler
-from utils import set_random_seeds, compute_metrics, save_queries_and_records
-from src.mlflow_utils import setup_mlflow, log_epoch_metrics, log_extra_params, log_model_checkpoint, end_mlflow_run
-
-PAD_IDX = 0
+from utils import compute_metrics, save_queries_and_records, set_random_seeds
 
 LOSS_FNS = {
     "cross_entropy": nn.CrossEntropyLoss,
 }
+
+
+# ── Shared generation helper ────────────────────────────────────────────
+
+def _generate_predictions(model, loader, max_new_tokens, num_beams, device):
+    """Run model.generate on every batch; return list of decoded strings."""
+    all_preds = []
+    with torch.no_grad():
+        for batch in tqdm(loader):
+            encoder_input = batch[0].to(device)
+            encoder_mask = batch[1].to(device)
+            outputs = model.generate(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
+            )
+            preds = _TOKENIZER.batch_decode(outputs, skip_special_tokens=True)
+            all_preds.extend(preds)
+    return all_preds
 
 
 # ── Training ────────────────────────────────────────────────────────────────
@@ -83,10 +112,12 @@ def train(cfg, model, train_loader, dev_loader, optimizer, scheduler, run_dir,
             "timing/train_tokens_per_sec": train_tokens / train_epoch_seconds if train_epoch_seconds > 0 else 0,
         }, step=epoch)
 
-        _improved = (record_f1 > best_val) if cfg.checkpointing.mode == "max" else (record_f1 < best_val)
+        # ── Check improvement (single computation) ──
+        improved = (record_f1 > best_val) if cfg.checkpointing.mode == "max" else (record_f1 < best_val)
+
         log_epoch_metrics({
-            "tracking/best_record_f1": record_f1 if _improved else best_val,
-            "tracking/epochs_since_improvement": 0 if _improved else epochs_since_improvement + 1,
+            "tracking/best_record_f1": record_f1 if improved else best_val,
+            "tracking/epochs_since_improvement": 0 if improved else epochs_since_improvement + 1,
         }, step=epoch)
 
         if cfg.log_system_metrics:
@@ -94,11 +125,8 @@ def train(cfg, model, train_loader, dev_loader, optimizer, scheduler, run_dir,
             log_epoch_metrics({f"system/{k}": v for k, v in system.items()}, step=epoch)
 
         # ── Checkpointing ──
-        tracked_metric = record_f1  # cfg.checkpointing.metric is "record_f1"
-        improved = (tracked_metric > best_val) if cfg.checkpointing.mode == "max" else (tracked_metric < best_val)
-
         if improved:
-            best_val = tracked_metric
+            best_val = record_f1
             best_metrics = {
                 "record_f1": record_f1, "record_em": record_em,
                 "sql_em": sql_em, "error_rate": error_rate,
@@ -159,7 +187,6 @@ def train_epoch(cfg, model, train_loader, optimizer, scheduler, device, global_s
     criterion = LOSS_FNS[cfg.loss_fn]()
 
     for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(train_loader):
-        batch_start = time.time()
         optimizer.zero_grad()
         encoder_input = encoder_input.to(device)
         encoder_mask = encoder_mask.to(device)
@@ -176,18 +203,11 @@ def train_epoch(cfg, model, train_loader, optimizer, scheduler, device, global_s
         loss = criterion(logits[non_pad], decoder_targets[non_pad])
         loss.backward()
 
-        # Compute gradient norm before clipping/step
-        grad_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                grad_norm += p.grad.data.norm(2).item() ** 2
-        grad_norm = grad_norm ** 0.5
+        # clip_grad_norm_ returns the total (unclipped) gradient norm
+        clip_val = cfg.grad_clip_norm if cfg.grad_clip_norm is not None else float("inf")
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), clip_val).item()
         total_grad_norm += grad_norm
         num_batches += 1
-
-        # Gradient clipping
-        if cfg.grad_clip_norm is not None:
-            nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
 
         optimizer.step()
         if scheduler is not None:
@@ -198,7 +218,6 @@ def train_epoch(cfg, model, train_loader, optimizer, scheduler, device, global_s
             total_loss += loss.item() * num_tokens
             total_tokens += num_tokens
 
-        # Per-batch metrics → MLflow only
         log_epoch_metrics({
             "batch/loss": loss.item(),
             "batch/gradient_norm": grad_norm,
@@ -211,23 +230,22 @@ def train_epoch(cfg, model, train_loader, optimizer, scheduler, device, global_s
     return avg_loss, avg_grad_norm, total_tokens, global_step
 
 
-# ── Evaluation ──────────────────────────────────────────────────────────────
+# ── Evaluation ──────────────────────────────────────────────────────────
 
 def eval_epoch(cfg, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path, device):
     model.eval()
     total_loss = 0
     total_tokens = 0
     criterion = LOSS_FNS[cfg.loss_fn]()
-    all_preds = []
 
+    # Compute loss over dev set
     with torch.no_grad():
-        for encoder_input, encoder_mask, decoder_input, decoder_targets, initial_dec in tqdm(dev_loader):
+        for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(dev_loader):
             encoder_input = encoder_input.to(device)
             encoder_mask = encoder_mask.to(device)
             decoder_input = decoder_input.to(device)
             decoder_targets = decoder_targets.to(device)
 
-            # Loss
             logits = model(
                 input_ids=encoder_input,
                 attention_mask=encoder_mask,
@@ -240,20 +258,11 @@ def eval_epoch(cfg, model, dev_loader, gt_sql_path, model_sql_path, gt_record_pa
             total_loss += loss.item() * num_tokens
             total_tokens += num_tokens
 
-            # Generation
-            outputs = model.generate(
-                input_ids=encoder_input,
-                attention_mask=encoder_mask,
-                max_new_tokens=cfg.max_new_tokens,
-                num_beams=cfg.num_beams,
-            )
-            tokenizer = dev_loader.dataset.tokenizer
-            preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            all_preds.extend(preds)
-
     eval_loss = total_loss / total_tokens
 
-    # Save predictions and compute metrics
+    # Generate predictions using shared helper
+    all_preds = _generate_predictions(model, dev_loader, cfg.max_new_tokens, cfg.num_beams, device)
+
     save_queries_and_records(all_preds, model_sql_path, model_record_path)
     sql_em, record_em, record_f1, error_msgs = compute_metrics(
         gt_sql_path, model_sql_path, gt_record_path, model_record_path
@@ -263,32 +272,16 @@ def eval_epoch(cfg, model, dev_loader, gt_sql_path, model_sql_path, gt_record_pa
     return eval_loss, record_f1, record_em, sql_em, error_rate
 
 
-# ── Test inference ──────────────────────────────────────────────────────────
+# ── Test inference ──────────────────────────────────────────────────────
 
 def test_inference(cfg, model, test_loader, model_sql_path, model_record_path, device):
     model.eval()
-    all_preds = []
-
-    with torch.no_grad():
-        for encoder_input, encoder_mask, initial_dec in tqdm(test_loader):
-            encoder_input = encoder_input.to(device)
-            encoder_mask = encoder_mask.to(device)
-
-            outputs = model.generate(
-                input_ids=encoder_input,
-                attention_mask=encoder_mask,
-                max_new_tokens=cfg.max_new_tokens,
-                num_beams=cfg.num_beams,
-            )
-            tokenizer = test_loader.dataset.tokenizer
-            preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            all_preds.extend(preds)
-
+    all_preds = _generate_predictions(model, test_loader, cfg.max_new_tokens, cfg.num_beams, device)
     save_queries_and_records(all_preds, model_sql_path, model_record_path)
     print(f"Test predictions saved to {model_sql_path}")
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────
+# ── Entry point ─────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Part 1: T5 fine-tune training")
@@ -334,33 +327,35 @@ def parse_args():
     return parser.parse_args()
 
 
+_CLI_TO_CFG = {
+    "num_epochs": "num_epochs",
+    "batch_size": "batch_size",
+    "test_batch_size": "test_batch_size",
+    "learning_rate": "learning_rate",
+    "weight_decay": "weight_decay",
+    "scheduler": "scheduler",
+    "patience_epochs": "patience_epochs",
+    "optimizer": "optimizer",
+    "num_warmup_epochs": "num_warmup_epochs",
+    "grad_clip_norm": "grad_clip_norm",
+    "dropout": "dropout",
+    "freeze_encoder": "freeze_encoder",
+    "freeze_embeddings": "freeze_embeddings",
+    "unfreeze_last_n_decoder": "unfreeze_last_n_decoder",
+    "input_prefix": "input_prefix",
+    "include_schema": "include_schema",
+    "resume": "resume_run_dir",
+    "max_time": "max_wall_clock_hours",
+    "max_new_tokens": "max_new_tokens",
+    "num_beams": "num_beams",
+    "seed": "seed",
+    "name": "name",
+}
+
+
 def apply_cli_overrides(cfg, cli):
     """Apply non-None CLI arguments to the config object."""
-    mapping = {
-        "num_epochs": "num_epochs",
-        "batch_size": "batch_size",
-        "test_batch_size": "test_batch_size",
-        "learning_rate": "learning_rate",
-        "weight_decay": "weight_decay",
-        "scheduler": "scheduler",
-        "patience_epochs": "patience_epochs",
-        "optimizer": "optimizer",
-        "num_warmup_epochs": "num_warmup_epochs",
-        "grad_clip_norm": "grad_clip_norm",
-        "dropout": "dropout",
-        "freeze_encoder": "freeze_encoder",
-        "freeze_embeddings": "freeze_embeddings",
-        "unfreeze_last_n_decoder": "unfreeze_last_n_decoder",
-        "input_prefix": "input_prefix",
-        "include_schema": "include_schema",
-        "resume": "resume_run_dir",
-        "max_time": "max_wall_clock_hours",
-        "max_new_tokens": "max_new_tokens",
-        "num_beams": "num_beams",
-        "seed": "seed",
-        "name": "name",
-    }
-    for cli_name, cfg_name in mapping.items():
+    for cli_name, cfg_name in _CLI_TO_CFG.items():
         val = getattr(cli, cli_name)
         if val is not None:
             setattr(cfg, cfg_name, val)
@@ -471,23 +466,17 @@ def main():
     model.eval()
 
     # Final dev eval
-    gt_sql_path = "data/dev.sql"
-    gt_record_path = "records/ground_truth_dev.pkl"
-    model_sql_path = "results/t5_ft_dev.sql"
-    model_record_path = "records/t5_ft_dev.pkl"
     _, f1, em, sql_em, err = eval_epoch(
-        cfg, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path, device
+        cfg, model, dev_loader, "data/dev.sql", "results/t5_ft_dev.sql",
+        "records/ground_truth_dev.pkl", "records/t5_ft_dev.pkl", device,
     )
     print(f"Final dev: F1={f1:.4f}, EM={em:.4f}, SQL_EM={sql_em:.4f}, err={err*100:.1f}%")
 
     # Test
-    test_sql_path = "results/t5_ft_test.sql"
-    test_record_path = "records/t5_ft_test.pkl"
-    test_inference(cfg, model, test_loader, test_sql_path, test_record_path, device)
+    test_inference(cfg, model, test_loader, "results/t5_ft_test.sql", "records/t5_ft_test.pkl", device)
     log_model_checkpoint(ckpt_dir)
     end_mlflow_run()
 
-    # Free GPU memory (important in persistent environments like Lightning AI)
     del model
     gc.collect()
     torch.cuda.empty_cache()
