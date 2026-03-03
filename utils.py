@@ -57,15 +57,16 @@ def load_queries_and_records(sql_path: str, record_path: str):
 
     return read_qs, records, error_msgs
 
-def save_queries_and_records(sql_queries: List[str], sql_path: str, record_path: str):
+def save_queries_and_records(sql_queries: List[str], sql_path: str, record_path: str, num_threads: int = 32):
     '''
     Helper function to save model generated SQL queries and their associated records
     to the specified paths.
 
-    Inputs: 
+    Inputs:
         * sql_queries (List[str]): The list of SQL queries to save
         * sql_path (str): Path to save SQL queries
         * record_path (str): Path to save database records associated with queries
+        * num_threads (int): Number of threads for parallel SQL execution
     '''
     # First save the queries
     with open(sql_path, 'w') as f:
@@ -73,7 +74,7 @@ def save_queries_and_records(sql_queries: List[str], sql_path: str, record_path:
             f.write(f'{query}\n')
 
     # Next compute and save records
-    records, error_msgs = compute_records(sql_queries)    
+    records, error_msgs = compute_records(sql_queries, num_threads=num_threads)
     with open(record_path, 'wb') as f:
         pickle.dump((records, error_msgs), f)
 
@@ -82,7 +83,7 @@ def read_queries(sql_path: str):
         qs = [q.strip() for q in f.readlines()]
     return qs
 
-def compute_records(processed_qs: List[str]):
+def compute_records(processed_qs: List[str], num_threads: int = 32):
     '''
     Helper function for computing the records associated with each SQL query in the
     input list. You may change the number of threads or the timeout variable (in seconds)
@@ -90,8 +91,8 @@ def compute_records(processed_qs: List[str]):
 
     Input:
         * processed_qs (List[str]): The list of SQL queries to execute
+        * num_threads (int): Number of worker threads for parallel SQL execution
     '''
-    num_threads = 10
     timeout_secs = 120
 
     pool = ThreadPoolExecutor(num_threads)

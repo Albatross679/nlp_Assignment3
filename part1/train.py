@@ -17,13 +17,11 @@ from part1.model import (
     save_model,
     save_training_state,
 )
-from src.infrastructure import setup_run
 from src.mlflow_utils import (
     end_mlflow_run,
     log_epoch_metrics,
     log_extra_params,
-    log_model_checkpoint,
-    setup_mlflow,
+    setup_run,
 )
 from src.utils.system_metrics import collect_system_metrics
 from t5_utils import initialize_optimizer_and_scheduler
@@ -73,6 +71,7 @@ def train(cfg, model, train_loader, dev_loader, optimizer, scheduler, run_dir,
 
     global_step = start_epoch * len(train_loader)
     _interrupted = False
+    _pred_cache = {}
     try:
       for epoch in range(start_epoch, cfg.num_epochs):
         epoch_start = time.time()
@@ -82,7 +81,8 @@ def train(cfg, model, train_loader, dev_loader, optimizer, scheduler, run_dir,
         )
         train_epoch_seconds = time.time() - train_t0
         eval_loss, record_f1, record_em, sql_em, error_rate = eval_epoch(
-            cfg, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path, device
+            cfg, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path, device,
+            pred_cache=_pred_cache,
         )
         epoch_time = time.time() - epoch_start
         epoch_times.append(epoch_time)
@@ -139,11 +139,6 @@ def train(cfg, model, train_loader, dev_loader, optimizer, scheduler, run_dir,
         else:
             epochs_since_improvement += 1
 
-        if cfg.checkpointing.enabled and cfg.checkpointing.save_last:
-            save_model(ckpt_dir, model, best=False,
-                       best_filename=cfg.checkpointing.best_filename,
-                       last_filename=cfg.checkpointing.last_filename)
-
         if cfg.checkpointing.enabled and cfg.checkpointing.save_every_n > 0 and (epoch + 1) % cfg.checkpointing.save_every_n == 0:
             save_model(ckpt_dir, model, best=False,
                        last_filename=f"model_epoch_{epoch}.pt")
@@ -167,9 +162,6 @@ def train(cfg, model, train_loader, dev_loader, optimizer, scheduler, run_dir,
         save_training_state(ckpt_dir, model, optimizer, scheduler,
                             epoch, best_val, epochs_since_improvement,
                             mlflow_run_id=mlflow_run_id)
-        save_model(ckpt_dir, model, best=False,
-                   best_filename=cfg.checkpointing.best_filename,
-                   last_filename=cfg.checkpointing.last_filename)
         print(f"State saved to {ckpt_dir}. Resume with --resume {run_dir}")
 
     if epoch_times:
@@ -232,7 +224,7 @@ def train_epoch(cfg, model, train_loader, optimizer, scheduler, device, global_s
 
 # ── Evaluation ──────────────────────────────────────────────────────────
 
-def eval_epoch(cfg, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path, device):
+def eval_epoch(cfg, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path, device, pred_cache=None):
     model.eval()
     total_loss = 0
     total_tokens = 0
@@ -263,10 +255,21 @@ def eval_epoch(cfg, model, dev_loader, gt_sql_path, model_sql_path, gt_record_pa
     # Generate predictions using shared helper
     all_preds = _generate_predictions(model, dev_loader, cfg.max_new_tokens, cfg.num_beams, device)
 
-    save_queries_and_records(all_preds, model_sql_path, model_record_path)
-    sql_em, record_em, record_f1, error_msgs = compute_metrics(
-        gt_sql_path, model_sql_path, gt_record_path, model_record_path
-    )
+    # Cache check: skip SQL execution if predictions are identical to last epoch
+    preds_key = hash(tuple(all_preds))
+    if pred_cache is not None and pred_cache.get("key") == preds_key:
+        print("Predictions unchanged — reusing cached SQL metrics")
+        sql_em, record_em, record_f1, error_msgs = pred_cache["metrics"]
+    else:
+        save_queries_and_records(all_preds, model_sql_path, model_record_path,
+                                 num_threads=cfg.sql_num_threads)
+        sql_em, record_em, record_f1, error_msgs = compute_metrics(
+            gt_sql_path, model_sql_path, gt_record_path, model_record_path
+        )
+        if pred_cache is not None:
+            pred_cache["key"] = preds_key
+            pred_cache["metrics"] = (sql_em, record_em, record_f1, error_msgs)
+
     error_rate = sum(1 for m in error_msgs if m) / len(error_msgs) if error_msgs else 0
 
     return eval_loss, record_f1, record_em, sql_em, error_rate
@@ -376,10 +379,7 @@ def main():
     cfg = load_config(cli.config)
     apply_cli_overrides(cfg, cli)
     set_random_seeds(cfg.seed)
-    run_dir, _ = setup_run(cfg)
     device = cfg.device
-    print(f"Run directory: {run_dir}")
-    print(f"Device: {device}")
 
     # Data
     train_loader, dev_loader, test_loader = load_t5_data(
@@ -398,6 +398,36 @@ def main():
         device=device,
     )
 
+    # Optimizer & scheduler
+    args = argparse.Namespace(
+        optimizer_type=cfg.optimizer,
+        learning_rate=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+        scheduler_type=cfg.scheduler or "none",
+        num_warmup_epochs=cfg.num_warmup_epochs,
+        max_n_epochs=cfg.num_epochs,
+    )
+    optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
+
+    # Resume: load training state first to recover MLflow run ID
+    start_epoch, best_val, epochs_since_imp = 0, None, 0
+    resume_mlflow_run_id = None
+    if cfg.resume_run_dir:
+        resume_ckpt = str(Path(cfg.resume_run_dir) / "checkpoints")
+        start_epoch, best_val, epochs_since_imp, resume_mlflow_run_id = load_training_state(
+            resume_ckpt, model, optimizer, scheduler, device
+        )
+        print(f"Resumed from epoch {start_epoch}, best_val={best_val:.4f}")
+        if resume_mlflow_run_id:
+            print(f"Resuming MLflow run {resume_mlflow_run_id}")
+
+    # Single setup: creates run directory + starts MLflow run
+    run_dir, mlflow_run_id = setup_run(
+        cfg, experiment_name="part1_t5_finetune", resume_run_id=resume_mlflow_run_id,
+    )
+    print(f"Run directory: {run_dir}")
+    print(f"Device: {device}")
+
     # Log one-time model & data params (skip on resume — already logged)
     if not cfg.resume_run_dir:
         total_params = sum(p.numel() for p in model.parameters())
@@ -411,34 +441,6 @@ def main():
         if torch.cuda.is_available():
             extra_params["gpu_name"] = torch.cuda.get_device_name()
         log_extra_params(extra_params)
-
-    # Optimizer & scheduler (reuse starter code helper)
-    args = argparse.Namespace(
-        optimizer_type=cfg.optimizer,
-        learning_rate=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        scheduler_type=cfg.scheduler or "none",
-        num_warmup_epochs=cfg.num_warmup_epochs,
-        max_n_epochs=cfg.num_epochs,
-    )
-    optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
-
-    # Resume from previous run if specified
-    start_epoch, best_val, epochs_since_imp = 0, None, 0
-    resume_mlflow_run_id = None
-    if cfg.resume_run_dir:
-        resume_ckpt = str(Path(cfg.resume_run_dir) / "checkpoints")
-        start_epoch, best_val, epochs_since_imp, resume_mlflow_run_id = load_training_state(
-            resume_ckpt, model, optimizer, scheduler, device
-        )
-        print(f"Resumed from epoch {start_epoch}, best_val={best_val:.4f}")
-        if resume_mlflow_run_id:
-            print(f"Resuming MLflow run {resume_mlflow_run_id}")
-
-    mlflow_run_id = setup_mlflow(
-        experiment_name="part1_t5_finetune", run_name=cfg.name,
-        params_dict=cfg.to_dict(), run_id=resume_mlflow_run_id,
-    )
 
     # Train
     _, interrupted = train(cfg, model, train_loader, dev_loader, optimizer, scheduler, run_dir,
@@ -474,7 +476,6 @@ def main():
 
     # Test
     test_inference(cfg, model, test_loader, "results/t5_ft_test.sql", "records/t5_ft_test.pkl", device)
-    log_model_checkpoint(ckpt_dir)
     end_mlflow_run()
 
     del model

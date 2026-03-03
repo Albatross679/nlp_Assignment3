@@ -94,8 +94,6 @@ Required submission output files (name and path must match exactly):
 
 ## Do Not Modify Contents
 
-- `evaluate.py` — grading evaluation script
-- `utils.py` — metrics computation (compute_metrics, compute_records, F1, EM)
 - `data/` — all dataset files (`.nl`, `.sql`, `.db`, `.schema`)
 - `records/ground_truth_dev.pkl` — ground-truth dev records
 
@@ -114,6 +112,14 @@ Tasks map to the three parts:
 - `part1` — T5 fine-tune
 - `part2` — T5 from scratch
 - `part3` — LLM prompting
+
+## MLflow
+
+Always use **port 8080** when launching MLflow in this virtual machine:
+
+```bash
+mlflow ui --port 8080
+```
 
 ## Key Commands
 

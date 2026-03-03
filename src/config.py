@@ -9,6 +9,7 @@ Hierarchy:
 
 from __future__ import annotations
 import json
+import os
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -142,6 +143,7 @@ class SLNeuralClsConfig(SLNeuralConfig):
     eval_metrics: list = field(default_factory=lambda: [
         "record_f1", "record_em", "sql_em", "error_rate",
     ])
+    sql_num_threads: int = field(default_factory=lambda: min(423, os.cpu_count() or 32))
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
