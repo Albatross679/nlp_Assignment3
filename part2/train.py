@@ -1,4 +1,4 @@
-"""Part 1 training: train loop, eval, test inference for T5 fine-tune."""
+"""Part 2 training: train loop, eval, test inference for T5 from scratch."""
 
 import argparse
 import gc
@@ -10,8 +10,8 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from part1.data import PAD_IDX, _TOKENIZER, load_t5_data
-from part1.model import (
+from part2.data import PAD_IDX, _TOKENIZER, load_t5_data
+from part2.model import (
     initialize_model,
     load_model_from_checkpoint,
     load_training_state,
@@ -431,11 +431,11 @@ def test_inference(cfg, model, test_loader, model_sql_path, model_record_path, d
 # ── Entry point ─────────────────────────────────────────────────────────
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Part 1: T5 fine-tune training")
+    parser = argparse.ArgumentParser(description="Part 2: T5 from-scratch training")
 
-    # ── Config variant (class name in part1.config) ──
-    parser.add_argument("--config", type=str, default="T5FineTuneConfig",
-                        help="Config class name in part1.config (e.g. 'T5FineTuneConfig_freeze_encoder')")
+    # ── Config variant (class name in part2.config) ──
+    parser.add_argument("--config", type=str, default="T5ScratchConfig",
+                        help="Config class name in part2.config (e.g. 'T5ScratchConfig')")
 
     # ── Training hyperparameters ──
     parser.add_argument("--num_epochs", type=int, default=None)
@@ -449,11 +449,6 @@ def parse_args():
     parser.add_argument("--num_warmup_epochs", type=int, default=None)
     parser.add_argument("--grad_clip_norm", type=float, default=None)
     parser.add_argument("--dropout", type=float, default=None)
-
-    # ── Layer freezing ──
-    parser.add_argument("--freeze_encoder", action="store_true", default=None)
-    parser.add_argument("--freeze_embeddings", action="store_true", default=None)
-    parser.add_argument("--unfreeze_last_n_decoder", type=int, default=None)
 
     # ── Input formatting ──
     parser.add_argument("--input_prefix", type=str, default=None)
@@ -486,9 +481,6 @@ _CLI_TO_CFG = {
     "num_warmup_epochs": "num_warmup_epochs",
     "grad_clip_norm": "grad_clip_norm",
     "dropout": "dropout",
-    "freeze_encoder": "freeze_encoder",
-    "freeze_embeddings": "freeze_embeddings",
-    "unfreeze_last_n_decoder": "unfreeze_last_n_decoder",
     "input_prefix": "input_prefix",
     "include_schema": "include_schema",
     "resume": "resume_run_dir",
@@ -509,8 +501,8 @@ def apply_cli_overrides(cfg, cli):
 
 
 def load_config(class_name):
-    """Look up a config class by name in part1.config and return an instance."""
-    import part1.config as cfg_mod
+    """Look up a config class by name in part2.config and return an instance."""
+    import part2.config as cfg_mod
     cls = getattr(cfg_mod, class_name, None)
     if cls is None:
         available = [n for n in dir(cfg_mod) if not n.startswith("_") and isinstance(getattr(cfg_mod, n), type)]
@@ -531,14 +523,11 @@ def main():
         input_prefix=cfg.input_prefix, include_schema=cfg.include_schema,
     )
 
-    # Model
+    # Model (from scratch — finetune=False)
     model = initialize_model(
         finetune=cfg.finetune,
         model_checkpoint=cfg.model_checkpoint,
         dropout=cfg.dropout,
-        freeze_encoder=cfg.freeze_encoder,
-        freeze_embeddings=cfg.freeze_embeddings,
-        unfreeze_last_n_decoder=cfg.unfreeze_last_n_decoder,
         device=device,
     )
 
@@ -567,7 +556,7 @@ def main():
 
     # Single setup: creates run directory + starts MLflow run
     run_dir, mlflow_run_id = setup_run(
-        cfg, experiment_name="part1_t5_finetune", resume_run_id=resume_mlflow_run_id,
+        cfg, experiment_name="part2_t5_scratch", resume_run_id=resume_mlflow_run_id,
     )
     print(f"Run directory: {run_dir}")
     print(f"Device: {device}")
@@ -613,13 +602,13 @@ def main():
 
     # Final dev eval
     _, f1, em, sql_em, err = eval_epoch(
-        cfg, model, dev_loader, "data/dev.sql", "results/t5_ft_dev.sql",
-        "records/ground_truth_dev.pkl", "records/t5_ft_dev.pkl", device,
+        cfg, model, dev_loader, "data/dev.sql", "results/t5_scr_dev.sql",
+        "records/ground_truth_dev.pkl", "records/t5_scr_dev.pkl", device,
     )
     print(f"Final dev: F1={f1:.4f}, EM={em:.4f}, SQL_EM={sql_em:.4f}, err={err*100:.1f}%")
 
     # Test
-    test_inference(cfg, model, test_loader, "results/t5_ft_test.sql", "records/t5_ft_test.pkl", device)
+    test_inference(cfg, model, test_loader, "results/t5_scr_test.sql", "records/t5_scr_test.pkl", device)
     end_mlflow_run()
 
     del model

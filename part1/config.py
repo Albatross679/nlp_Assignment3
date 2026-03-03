@@ -44,6 +44,7 @@ class T5FineTuneConfig(SLNeuralClsConfig):
     # ── Evaluation ───────────────────────────────────────────────────────
     sql_num_threads: int = field(default_factory=lambda: min(423, os.cpu_count() or 32))
 
+    save_training_state: bool = False   # saves optimizer/scheduler for resume; set False to save ~2 GB/run
 
 @dataclass
 class T5FineTuneConfig_base(T5FineTuneConfig):

@@ -54,6 +54,7 @@ class CheckpointingConfig:
     save_best: bool = True
     save_last: bool = True
     save_every_n: int = 0
+    save_training_state: bool = True   # saves optimizer/scheduler for resume; set False to save ~2 GB/run
     metric: str = "record_f1"
     mode: str = "max"
     best_filename: str = "model_best.pt"
@@ -127,6 +128,9 @@ class SLNeuralConfig(BaseConfig):
     # Regularization
     grad_clip_norm: Optional[float] = None
     dropout: float = 0.0
+
+    # Evaluation frequency
+    eval_every_n_epochs: int = 1          # run eval every N epochs (1 = every epoch)
 
     # Early stopping
     patience_epochs: int = 0              # 0 disables
